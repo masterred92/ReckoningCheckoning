@@ -1,0 +1,18 @@
+## Interface: 16001
+## Title: Reckoning Checkoning
+## Notes: Reckoning and Seal of Command counter for Paladins: stored Reckoning charges and COMMAND! procs live, then damage, share and average from the game's own damage meter. Blizzard sounds and textures only.
+## Author: Kenny
+## Version: 1.0.0
+## SavedVariables: KennyReckoningCheckoningDB
+## X-License: MIT
+## IconTexture: Interface\Icons\Spell_Holy_BlessingOfStrength
+## X-Category: Combat
+## X-Website: https://github.com/masterred92/ReckoningCheckoning
+
+Libs\KennyShared\Compat.lua
+Libs\KennyShared\Core.lua
+Libs\KennyShared\Hub.lua
+Locales\enUS.lua
+Themes.lua
+ReckoningCheckoning.lua
+Frame.lua
