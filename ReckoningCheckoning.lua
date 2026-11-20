@@ -26,7 +26,6 @@ ns.RC = RC
 
 local SCHEMA = 1
 
-RC.RECK_TALENT = 20177
 RC.RECK_BUFF = 1326084
 RC.RECK_MAX = 4
 -- Meter lines that are Reckoning's own (if the game lists any).
@@ -251,7 +250,7 @@ function RC.UpdateCharges()
         countGain(c - before)
         if ns.UI then ns.UI.OnGain() end
       end
-    elseif c < before then
+    elseif c < before and RC.auraReadable then -- spends only from a buff the game kept visible
       countSpent(before - c)
     end
   end
@@ -578,7 +577,7 @@ ev:RegisterUnitEvent("UNIT_AURA", "player")
 for _, e in ipairs({ "PLAYER_LOGIN", "TRAIT_CONFIG_UPDATED", "ACTIVE_TALENT_GROUP_CHANGED", "PLAYER_TALENT_UPDATE" }) do ev:RegisterEvent(e) end
 
 local handlers = {
-  PLAYER_REGEN_DISABLED = function() RC.EvaluateMode(); RC.StartFight() end,
+  PLAYER_REGEN_DISABLED = function() RC.EvaluateMode(); RC.StartFight(); RC.UpdateCharges() end,
   PLAYER_REGEN_ENABLED = function()
     RC.EndFight()
     if RC.themeStale then RC.themeStale = false; RC.UpdateTheme() end

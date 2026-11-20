@@ -5,6 +5,7 @@
 - Reckoning Checkoning now checks what the client allows (at login, at the start of each fight and on `/reck debug`) and picks how to count: from the Reckoning buff when the game keeps it visible, otherwise from your own Seal of Command and Reckoning cast events if the game sends them. Extra attacks spent can only be seen from the buff, so without it they show as `?`, never as a made-up 0.
 - If neither is available, the box says plainly that procs can't be counted on this client and shows Seal of Command (and Reckoning, if listed) damage and share from the game's damage meter after each fight.
 - Fixed: Seal of Command procs that land at the same moment (for example on stored Reckoning swings) were merged into one. Each proc now counts; only the same cast event delivered twice is ignored.
+- When combat starts and the buff is hidden, the charge count from before the fight is cleared to unknown straight away, and a drop in stacks is only counted as extra attacks spent when the game kept the buff visible.
 - This detection follows the game's documented rules for this client and should work here; confirmation in game will come from players. `/reck debug` shows which method is active and what the client allows, which helps with bug reports.
 
 ## 1.0.0

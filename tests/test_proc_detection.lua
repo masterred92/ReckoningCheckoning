@@ -144,5 +144,16 @@ local ok2, dl = pcall(RC.DetectionLines)
 check(ok and ok2 and type(dl) == "table" and not RC.auraReadable, "missing APIs: no aura mode, no error")
 startFight(); M.fire("UNIT_AURA", "player", {}); endFight()
 C_Secrets, C_UnitAuras = keepS, keepU
+-- 9. No UNIT_AURA at all during a hidden fight: the pre-combat count must not survive, and the stack drop seen
+--    after combat must not be counted (or flashed) as extra attacks spent.
+S.restrictions = true; S.never[RECK] = nil
+S.gain(RECK, 3)
+check(RC.chargesKnown and RC.charges == 3, "silent fight: 3 charges readable before combat")
+startFight()
+check(not RC.chargesKnown, "silent fight: count goes unknown when combat starts")
+S.auras[RECK].applications = 1 -- spent in combat, no UNIT_AURA delivered
+endFight()
+check(RC.lastFight.spent == 0 and RC.lastFight.spentKnown == false, "silent fight: drop across hidden stretch not counted")
+check(RC.chargesKnown and RC.charges == 1, "silent fight: count readable again after combat")
 check(#ns.Core.errors == 0, "no Lua errors recorded")
 M.done("ReckoningCheckoning proc detection")
