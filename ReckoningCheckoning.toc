@@ -2,7 +2,7 @@
 ## Title: Reckoning Checkoning
 ## Notes: Reckoning and Seal of Command counter for Paladins: stored Reckoning charges and COMMAND! procs live, then damage, share and average from the game's own damage meter. Blizzard sounds and textures only.
 ## Author: Kenny
-## Version: 1.0.0
+## Version: 1.0.1
 ## SavedVariables: KennyReckoningCheckoningDB
 ## X-License: MIT
 ## IconTexture: Interface\Icons\Spell_Holy_BlessingOfStrength
