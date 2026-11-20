@@ -11,8 +11,8 @@
 --
 -- Addons on this client get no combat log and every hit amount is a secret value, so nothing here guesses a number.
 -- Damage, share and average come from Blizzard's own damage meter (C_DamageMeter) once combat ends. In combat
--- those numbers are secret and only handed to widgets. Aura stack counts may also be secret in combat: then the
--- big charge number is still shown (widgets accept secrets) but pips, gains and spends fall back to cast events.
+-- those numbers are secret and only handed to widgets. How procs and charges can be seen in combat depends on the
+-- client's secret-value rules; see "proc detection" below.
 local ADDON, ns = ...
 local C, Core = ns.Compat, ns.Core
 local L = Core.L
@@ -25,7 +25,6 @@ KennyReckoningCheckoning = RC
 ns.RC = RC
 
 local SCHEMA = 1
-local DEDUPE = 0.25 -- seconds: a cast event and the matching aura change for one proc arrive together
 
 RC.RECK_TALENT = 20177
 RC.RECK_BUFF = 1326084
@@ -55,8 +54,9 @@ local migrations = {} -- schema 1 is the first release
 
 local function now() return C.Clock() end
 
+-- blind = the charge count was hidden at some point in this fight, so extra attacks spent can't be known.
 local function newFight()
-  return { command = 0, gained = 0, spent = 0, start = now(), times = {} }
+  return { command = 0, gained = 0, spent = 0, start = now(), times = {}, blind = false }
 end
 local function newSession()
   return { command = 0, gained = 0, spent = 0, fights = 0, total = 0, cmdDmg = 0, reckDmg = 0,
@@ -67,7 +67,7 @@ RC.fight = newFight()
 RC.lastFight = nil
 RC.charges = 0          -- last plain charge count (0-4)
 RC.chargesRaw = 0       -- last value from the aura (may be secret; only handed to widgets)
-RC.chargesKnown = true  -- false while the aura's stack count is secret
+RC.chargesKnown = true  -- false while the buff or its stack count is hidden by the game
 RC.lastEvent = nil      -- "command" or "reckoning": which headline moved last
 
 function RC.DB() return db end
@@ -104,11 +104,8 @@ local function commandStreak(t)
 end
 
 -- ---------- Seal of Command ----------
-local lastCommand
 function RC.OnCommand(t)
   t = t or now()
-  if lastCommand and t - lastCommand < DEDUPE then return false end
-  lastCommand = t
   local f = RC.fight
   f.command = f.command + 1
   f.times[#f.times + 1] = t
@@ -121,14 +118,10 @@ function RC.OnCommand(t)
 end
 
 -- ---------- Reckoning ----------
--- A charge can be seen twice: as a 1326084 cast and as a stack going up. Each sighting consumes the other within
--- DEDUPE seconds, so one proc counts once whichever arrives first.
-local castGainAt, stackGainAt
-
-local function countGain()
+local function countGain(n)
   local f = RC.fight
-  f.gained = f.gained + 1
-  if db then db.session.gained = db.session.gained + 1 end
+  f.gained = f.gained + n
+  if db then db.session.gained = db.session.gained + n end
   RC.lastEvent = "reckoning"
 end
 
@@ -141,21 +134,95 @@ local function countSpent(n)
   if ns.UI then ns.UI.OnSpent(n) end
 end
 
-function RC.OnReckoningCast(t)
-  t = t or now()
-  if stackGainAt and t - stackGainAt < DEDUPE then stackGainAt = nil return false end
-  castGainAt = t
-  countGain()
+-- One Reckoning charge from the player's 1326084 cast event (only used while the buff can't be read).
+function RC.OnReckoningCast()
+  countGain(1)
   if ns.UI then ns.UI.OnGain() end
   return true
 end
 
--- Read the stored charges from the buff. Returns plain count (or nil when the count is secret) and the raw value.
+-- ---------- proc detection ----------
+-- WoW: Forever hides aura data from addons in combat (UNIT_AURA payload: SecretWhenAurasRestricted;
+-- C_UnitAuras.GetPlayerAuraBySpellID: SecretWhenUnitAuraRestricted + RequiresNonSecretAura, so a hidden aura
+-- returns NOTHING, which looks exactly like "no buff"). Only a spell the client flags never-secret
+-- (C_Secrets.GetSpellAuraSecrecy == 0) stays readable. Whether the Reckoning buff has that flag is only known in
+-- game, so the way things are counted is picked at runtime and checked again at login, at the start of every
+-- fight and on /reck debug:
+--   "aura": the Reckoning buff can be read in combat. Charges gained = stack count going up, extra attacks spent =
+--           stack count going down. Seal of Command is not an aura, so it is always counted from cast events.
+--   "cast": the client has sent the player's UNIT_SPELLCAST_SUCCEEDED for 20424 (Seal of Command) or 1326084
+--           (Reckoning) with a plain spell ID. Command procs and Reckoning charges gained are counted from those.
+--           Extra attacks spent can't be seen in this mode and are shown as "?", never as 0.
+--   "none": neither works. The window says procs can't be counted here; damage still comes from the game's meter
+--           after the fight, when the meter lists Seal of Command or Reckoning as their own lines.
+-- Each count has exactly one source (Reckoning gains: buff if readable, else cast), so one proc never counts
+-- twice and no time-based dedupe is needed: Seal of Command procs on the stored Reckoning swings all count.
+RC.PROBE = { RC.RECK_BUFF, RC.COMMAND_PROC }
+RC.secrecy = {}          -- spellID -> 0 never / 1 always / 2 contextually secret, nil = unknown
+RC.restricted = nil      -- C_Secrets.HasSecretRestrictions(): true / false / nil (unknown)
+RC.auraReadable = false  -- the Reckoning buff can be read in combat
+RC.detect = "none"       -- "aura", "cast" or "none" (RC.Mode() is the headline choice, not this)
+RC.castsSeen = { [RC.COMMAND_PROC] = 0, [RC.RECK_BUFF] = 0 }
+
+local function call(fn, ...)
+  if type(fn) ~= "function" then return nil end
+  local ok, v = pcall(fn, ...)
+  if not ok or C.IsSecret(v) then return nil end
+  return v
+end
+
+local function auraAPI()
+  return C_UnitAuras ~= nil and type(C_UnitAuras.GetPlayerAuraBySpellID) == "function"
+end
+
+-- Has this client ever sent the player's cast event for spellID (or for either spell when id is nil)?
+function RC.CastSeen(id)
+  local seen = db and db.castSeen
+  if type(seen) ~= "table" then return false end
+  if id then return seen[id] == true end
+  return seen[RC.COMMAND_PROC] == true or seen[RC.RECK_BUFF] == true
+end
+function RC.CanCountCommand() return RC.CastSeen(RC.COMMAND_PROC) end
+function RC.CanCountGains() return RC.auraReadable or RC.CastSeen(RC.RECK_BUFF) end
+function RC.CanCountSpent(f) return RC.auraReadable and not (f or RC.fight).blind end
+
+-- Work out whether the Reckoning buff is readable, then the mode. Safe on any client.
+function RC.EvaluateMode()
+  local S = C_Secrets
+  RC.restricted = S and call(S.HasSecretRestrictions)
+  -- a client with neither C_Secrets nor issecretvalue has no secret values at all
+  if RC.restricted == nil and type(S) ~= "table" and issecretvalue == nil then RC.restricted = false end
+  for _, id in ipairs(RC.PROBE) do
+    local level = S and call(S.GetSpellAuraSecrecy, id)
+    RC.secrecy[id] = type(level) == "number" and level or nil
+  end
+  RC.auraReadable = (RC.restricted == false or RC.secrecy[RC.RECK_BUFF] == 0) and auraAPI()
+  RC.detect = RC.auraReadable and "aura" or (RC.CastSeen() and "cast") or "none"
+  return RC.detect
+end
+
+-- Would the game hide the Reckoning buff from us right now? Then "no buff" from GetPlayerAuraBySpellID means
+-- "unknown", not 0 charges.
+function RC.AuraHiddenNow()
+  if RC.restricted == false then return false end
+  local S = C_Secrets
+  local v = S and call(S.ShouldSpellAuraBeSecret, RC.RECK_BUFF)
+  if v ~= nil then return v == true end
+  if RC.secrecy[RC.RECK_BUFF] == 0 then return false end
+  return C.InCombat() -- no answer from the client: in combat, assume hidden
+end
+
+-- Read the stored charges from the buff. Returns the plain count and the raw value, or nil when the count is
+-- unknown (buff hidden, read failed or stack count secret; a secret raw count may still come back for widgets).
 function RC.ReadCharges()
-  if not (C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID) then return nil, nil end
+  if not auraAPI() then return nil, nil end
   local ok, aura = pcall(C_UnitAuras.GetPlayerAuraBySpellID, RC.RECK_BUFF)
   if not ok or C.IsSecret(aura) then return nil, nil end
-  if aura == nil then return 0, 0 end
+  if aura == nil then
+    if RC.AuraHiddenNow() then return nil, nil end -- hidden, not empty: never read this as 0 charges
+    return 0, 0
+  end
+  if type(aura) ~= "table" then return nil, nil end
   local ok2, apps = pcall(function() return aura.applications end)
   if not ok2 then return nil, nil end
   if C.IsSecret(apps) then return nil, apps end
@@ -164,13 +231,14 @@ function RC.ReadCharges()
   return math.min(RC.RECK_MAX, apps), apps
 end
 
--- Compare the new stack count with the last plain one: up = charges gained, down = extra attacks spent.
-function RC.UpdateCharges(t)
-  t = t or now()
+-- Compare the new stack count with the last plain one: up = charges gained (when the buff is the gain source),
+-- down = extra attacks spent. An unknown count in between breaks the chain: nothing is counted across it.
+function RC.UpdateCharges()
   local c, raw = RC.ReadCharges()
   if c == nil then
     RC.chargesKnown = false
-    if raw ~= nil then RC.chargesRaw = raw end
+    RC.chargesRaw = raw
+    if RC.fight.inCombat then RC.fight.blind = true end
     if ns.UI then ns.UI.RefreshCharges() end
     return
   end
@@ -179,30 +247,64 @@ function RC.UpdateCharges(t)
   RC.charges, RC.chargesRaw = c, raw
   if before then
     if c > before then
-      local gained = false
-      for _ = 1, c - before do
-        if castGainAt and t - castGainAt < DEDUPE then castGainAt = nil
-        else countGain(); gained = true end
-        stackGainAt = t
+      if RC.auraReadable then
+        countGain(c - before)
+        if ns.UI then ns.UI.OnGain() end
       end
-      if ns.UI and gained then ns.UI.OnGain() end
     elseif c < before then
       countSpent(before - c)
     end
   end
-  if c >= RC.RECK_MAX and (before or 0) < RC.RECK_MAX and settings and settings.sound == "big" then RC.Chime() end
+  if c >= RC.RECK_MAX and before and before < RC.RECK_MAX and settings and settings.sound == "big" then RC.Chime() end
   if ns.UI then ns.UI.RefreshCharges() end
 end
 
-function RC.OnSpellcast(unit, _, spellID)
+-- The player's own cast events for 20424 and 1326084. A secret spell ID, another unit or the same cast delivered
+-- twice (same cast GUID) is ignored.
+local lastCastGUID
+function RC.OnSpellcast(unit, castGUID, spellID)
   if unit ~= "player" or C.IsSecret(spellID) then return end
+  if spellID ~= RC.COMMAND_PROC and spellID ~= RC.RECK_BUFF then return end
+  local guid = C.Safe(castGUID)
+  if guid ~= nil and guid == lastCastGUID then return end
+  lastCastGUID = guid
+  RC.castsSeen[spellID] = RC.castsSeen[spellID] + 1
+  if db then
+    if type(db.castSeen) ~= "table" then db.castSeen = {} end
+    db.castSeen[spellID] = true
+  end
+  if RC.detect == "none" then RC.detect = "cast" end
   if spellID == RC.COMMAND_PROC then RC.OnCommand()
-  elseif spellID == RC.RECK_BUFF then RC.OnReckoningCast() end
+  elseif not RC.auraReadable then RC.OnReckoningCast() -- else counted from the buff
+  elseif ns.UI then ns.UI.Refresh() end
 end
 
 function RC.OnAura(unit)
   if unit ~= "player" then return end
   RC.UpdateCharges()
+end
+
+-- Diagnostic lines for /reck debug: restriction state, each spell's secrecy, the buff, cast events and the mode.
+function RC.DetectionLines()
+  RC.EvaluateMode()
+  local S = C_Secrets
+  local aura = "-"
+  if auraAPI() then
+    local ok, a = pcall(C_UnitAuras.GetPlayerAuraBySpellID, RC.RECK_BUFF)
+    aura = not ok and "error" or C.IsSecret(a) and "secret" or a ~= nil and "up"
+      or (RC.AuraHiddenNow() and "no data (hidden by the game)" or "not up")
+  end
+  return {
+    ("detection mode: %s  (aura = buff read, cast = cast events, none = can't count procs)"):format(RC.detect),
+    ("secret restrictions: %s, auras secret now: %s, Reckoning buff secret now: %s, in combat: %s"):format(
+      tostring(RC.restricted), tostring(S and call(S.ShouldAurasBeSecret)),
+      tostring(S and call(S.ShouldSpellAuraBeSecret, RC.RECK_BUFF)), tostring(C.InCombat())),
+    ("  %d Reckoning buff: secrecy %s (0 = never secret), aura %s"):format(RC.RECK_BUFF, tostring(RC.secrecy[RC.RECK_BUFF]), aura),
+    ("  %d Seal of Command: secrecy %s"):format(RC.COMMAND_PROC, tostring(RC.secrecy[RC.COMMAND_PROC])),
+    ("cast events seen this session: Command %d, Reckoning %d; ever: Command %s, Reckoning %s"):format(
+      RC.castsSeen[RC.COMMAND_PROC], RC.castsSeen[RC.RECK_BUFF],
+      tostring(RC.CastSeen(RC.COMMAND_PROC)), tostring(RC.CastSeen(RC.RECK_BUFF))),
+  }
 end
 
 -- ---------- mode: which headline the box leads with ----------
@@ -302,18 +404,19 @@ end
 
 function RC.FinishFight(f, r)
   f.done = true
-  local res = { command = f.command, gained = f.gained, spent = f.spent, duration = f.duration or 0 }
+  local res = { command = f.command, gained = f.gained, spent = f.spent, duration = f.duration or 0,
+    commandKnown = RC.CanCountCommand(), gainsKnown = RC.CanCountGains(), spentKnown = RC.CanCountSpent(f) }
   if r then
     res.total = r.total
     if r.cmdSplit then
       res.cmd = r.cmd
       res.cmdShare = r.total > 0 and r.cmd / r.total or 0
-      res.cmdAvg = f.command > 0 and r.cmd / f.command or nil
+      res.cmdAvg = res.commandKnown and f.command > 0 and r.cmd / f.command or nil
     end
     if r.reckSplit then
       res.reck = r.reck
       res.reckShare = r.total > 0 and r.reck / r.total or 0
-      res.reckAvg = f.spent > 0 and r.reck / f.spent or nil
+      res.reckAvg = res.spentKnown and f.spent > 0 and r.reck / f.spent or nil
     end
   end
   RC.lastFight = res
@@ -322,11 +425,11 @@ function RC.FinishFight(f, r)
     s.fights = s.fights + 1
     if r then
       s.total = s.total + r.total
-      if f.command > 0 then db.commandSplits = r.cmdSplit end
-      if f.spent > 0 or f.gained > 0 then db.reckSplits = r.reckSplit end
+      if f.command > 0 or r.cmdSplit then db.commandSplits = r.cmdSplit end
+      if f.spent > 0 or f.gained > 0 or r.reckSplit then db.reckSplits = r.reckSplit end
       if r.cmdSplit then
         s.cmdDmg = s.cmdDmg + r.cmd
-        s.cmdMeasured = s.cmdMeasured + f.command
+        if res.commandKnown then s.cmdMeasured = s.cmdMeasured + f.command end
         if res.cmdAvg and res.cmdAvg > s.bestAvg and f.command >= 2 then
           local beaten = s.bestAvg > 0
           s.bestAvg = res.cmdAvg
@@ -336,7 +439,7 @@ function RC.FinishFight(f, r)
       end
       if r.reckSplit then
         s.reckDmg = s.reckDmg + r.reck
-        s.reckMeasured = s.reckMeasured + f.spent
+        if res.spentKnown then s.reckMeasured = s.reckMeasured + f.spent end
       end
     end
   end
@@ -450,7 +553,7 @@ function RC.StateLines()
   local s = RC.SessionStats() or {}
   local avail, why = RC.MeterAvailable()
   local f = RC.lastFight
-  return {
+  local lines = {
     "settings: sound=" .. tostring(settings and settings.sound) .. " file=" .. tostring(settings and settings.soundFile)
       .. " mode=" .. tostring(settings and settings.mode) .. " (" .. tostring(RC.Mode()) .. ")",
     "class: " .. tostring(RC.ClassFile()) .. " / tree: " .. tostring(RC.theme and RC.theme.tree or "class default"),
@@ -458,8 +561,11 @@ function RC.StateLines()
     "meter lists Seal of Command: " .. tostring(db and db.commandSplits) .. ", Reckoning: " .. tostring(db and db.reckSplits),
     "charges: " .. (RC.chargesKnown and tostring(RC.charges) or "hidden by the game right now"),
     ("session: %s Command procs, %s charges gained, %s extra attacks, %s fights"):format(tostring(s.command), tostring(s.gained), tostring(s.spent), tostring(s.fights)),
-    "last fight: " .. (f and ("%d Command, %d gained, %d spent, total %s"):format(f.command, f.gained, f.spent, RC.Short(f.total)) or "none"),
+    "last fight: " .. (f and ("%d Command, %d gained, %s spent, total %s"):format(f.command, f.gained,
+      f.spentKnown and tostring(f.spent) or "unknown", RC.Short(f.total)) or "none"),
   }
+  for _, l in ipairs(RC.DetectionLines()) do lines[#lines + 1] = l end
+  return lines
 end
 
 -- ---------- events ----------
@@ -472,7 +578,7 @@ ev:RegisterUnitEvent("UNIT_AURA", "player")
 for _, e in ipairs({ "PLAYER_LOGIN", "TRAIT_CONFIG_UPDATED", "ACTIVE_TALENT_GROUP_CHANGED", "PLAYER_TALENT_UPDATE" }) do ev:RegisterEvent(e) end
 
 local handlers = {
-  PLAYER_REGEN_DISABLED = function() RC.StartFight() end,
+  PLAYER_REGEN_DISABLED = function() RC.EvaluateMode(); RC.StartFight() end,
   PLAYER_REGEN_ENABLED = function()
     RC.EndFight()
     if RC.themeStale then RC.themeStale = false; RC.UpdateTheme() end
@@ -480,6 +586,7 @@ local handlers = {
   UNIT_SPELLCAST_SUCCEEDED = RC.OnSpellcast,
   UNIT_AURA = RC.OnAura,
   PLAYER_LOGIN = function()
+    RC.EvaluateMode()
     RC.UpdateTheme()
     RC.UpdateCharges()
     if ns.UI then ns.UI.UpdateVisibility() end
@@ -505,7 +612,8 @@ end)
 Core.Setup({ cmd = ns.SLASH[1],
   required = { "C_DamageMeter.GetCombatSessionSourceFromType", "C_DamageMeter.GetAvailableCombatSessions",
     "C_DamageMeter.GetCombatSessionSourceFromID", "PlaySoundFile", "C_Timer.After", "UnitGUID" },
-  optional = { "C_UnitAuras.GetPlayerAuraBySpellID", "C_DamageMeter.IsDamageMeterAvailable", "AbbreviateNumbers",
+  optional = { "C_UnitAuras.GetPlayerAuraBySpellID", "C_Secrets.GetSpellAuraSecrecy", "C_Secrets.ShouldSpellAuraBeSecret",
+    "C_Secrets.HasSecretRestrictions", "C_DamageMeter.IsDamageMeterAvailable", "AbbreviateNumbers",
     "C_ClassTalents.GetActiveConfigID", "C_Traits.GetGroupDisplayInfoByTreeID", "C_Traits.GetGroupCurrencyInfo" },
   db = function() return db end,
   firstRun = { L["Reckoning and Seal of Command counter ready. Drag the box to move it; type %s for options."]:format(ns.SLASH[1]) },

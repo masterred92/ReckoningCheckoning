@@ -1,6 +1,11 @@
 package.path = "./tests/?.lua;" .. package.path
 local M = require("mock_wow")
 M.install()
+-- This file covers a client where the Reckoning buff is flagged never-secret ("aura" mode).
+-- tests/test_proc_detection.lua covers the strict client and the moves between modes.
+local S = require("mock_secrets").install(M)
+S.auras = M.auras
+S.never[1326084] = true
 M.class = "PALADIN"
 M.trees = { { 594, "Holy", 0 }, { 267, "Protection", 31 }, { 184, "Retribution", 5 } }
 local ns = M.loadAddon(".", "ReckoningCheckoning")
@@ -29,8 +34,8 @@ for _, sl in ipairs(ns.THEME.order) do check(ns.THEME.trees[sl], "tree " .. sl .
 -- Seal of Command: 20424 counts; seal auras, other spells, other units and secret IDs do not
 M.fire("PLAYER_REGEN_DISABLED"); M.combat = true
 M.fire("UNIT_SPELLCAST_SUCCEEDED", "player", "c1", 20424)
-M.fire("UNIT_SPELLCAST_SUCCEEDED", "player", "c1b", 20424) -- same instant: deduped
-check(RC.fight.command == 1, "one Command proc, duplicate ignored")
+M.fire("UNIT_SPELLCAST_SUCCEEDED", "player", "c1", 20424) -- the same cast delivered twice: deduped
+check(RC.fight.command == 1, "one Command proc, duplicate cast GUID ignored")
 check(UI.Frame().head:GetText() == "COMMAND!", "COMMAND! flash")
 M.advance(1)
 M.fire("UNIT_SPELLCAST_SUCCEEDED", "player", "c2", 20424)
@@ -41,13 +46,15 @@ local secretID = {}; M.secret[secretID] = true
 M.fire("UNIT_SPELLCAST_SUCCEEDED", "player", "c5", secretID)
 check(RC.fight.command == 2, "seal cast, other units and secret IDs ignored")
 
--- Reckoning: stack count readable. Cast + stack-up for one proc counts once; a drop counts extra attacks spent
+check(RC.detect == "aura" and RC.auraReadable, "never-secret Reckoning buff: aura mode")
+-- Reckoning: stack count readable. Gains come from the stack only (the cast is not a second source); a drop
+-- counts extra attacks spent
 M.sounds = {}
 M.advance(1)
 M.fire("UNIT_SPELLCAST_SUCCEEDED", "player", "r1", 1326084)
 M.auras[1326084] = { applications = 1 }
 M.fire("UNIT_AURA", "player", {})
-check(RC.fight.gained == 1 and RC.charges == 1, "one charge, cast and stack deduped")
+check(RC.fight.gained == 1 and RC.charges == 1, "one charge, counted once from the stack")
 M.advance(2)
 M.auras[1326084] = { applications = 2 }; M.fire("UNIT_AURA", "player", {})
 M.advance(2)
@@ -60,13 +67,13 @@ check(RC.charges == 4 and #M.sounds == 1, "full store (4/4) plays the chime")
 M.advance(2)
 M.auras[1326084] = nil; M.fire("UNIT_AURA", "player", {})
 check(RC.fight.spent == 4 and RC.charges == 0, "next swing spends all 4 stored attacks")
--- stack count secret in combat: number goes to the widget as is, gains come from casts only
+-- stack count secret: number goes to the widget as is, nothing counted from it
 local secretApps = setmetatable({}, { __tostring = function() return "SECRET" end }); M.secret[secretApps] = true
 M.auras[1326084] = { applications = secretApps }; M.fire("UNIT_AURA", "player", {})
 check(RC.chargesKnown == false and RC.fight.spent == 4, "secret stack count: nothing spent or guessed")
 M.advance(1)
 M.fire("UNIT_SPELLCAST_SUCCEEDED", "player", "r3", 1326084)
-check(RC.fight.gained == 5, "secret stack count: casts still count gains")
+check(RC.fight.gained == 4 and RC.fight.blind, "secret stack count: no gain guessed, fight marked blind")
 UI.RefreshCharges()
 check(true, "secret charge number rendered without maths")
 -- live view with secret meter values: no maths, no error

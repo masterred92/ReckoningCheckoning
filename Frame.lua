@@ -193,7 +193,7 @@ function UI.OnSpent(n)
   UI.Refresh()
 end
 
--- Big number and pips. The number accepts a secret stack count; pips need a plain one.
+-- Big number and pips. The number accepts a secret stack count; pips need a plain one. Hidden = "?".
 function UI.RefreshCharges()
   if not frame then return end
   local showReck = RC.Mode() ~= "command"
@@ -205,7 +205,8 @@ function UI.RefreshCharges()
   end
   if not showReck then return end
   if RC.chargesKnown then frame.big:SetFormattedText("%d/%d", RC.charges, RC.RECK_MAX)
-  else frame.big:SetFormattedText("%s", RC.chargesRaw) end
+  elseif RC.chargesRaw ~= nil then frame.big:SetFormattedText("%s", RC.chargesRaw)
+  else frame.big:SetText("?/" .. RC.RECK_MAX) end
 end
 
 function UI.OnCombat(inCombat)
@@ -218,36 +219,44 @@ function UI.OnCombat(inCombat)
   UI.Refresh()
 end
 
+-- Counts the game hid from us show as "?", never as 0.
+local function n(v, known) return known and tostring(v) or "?" end
+local NOTE_NONE = "|cffaaaaaa" .. L["Procs can't be counted on this client: the game hides them from addons. Damage shows after each fight when the game's meter lists it."] .. "|r"
+local NOTE_SPENT = "|cffaaaaaa" .. L["Extra attacks spent are hidden by the game in combat here."] .. "|r"
+UI.NOTE_NONE = NOTE_NONE
+
 -- Plain-number view (out of combat): last fight + session.
 function UI.Lines()
   local f, s = RC.lastFight, RC.SessionStats() or {}
   local mode = RC.Mode()
   local out = {}
   local cmdOn, reckOn = mode ~= "reckoning", mode ~= "command"
-  if f then
-    if cmdOn then
-      if f.cmd then
-        out[#out + 1] = ("%s: %d %s, %s (%s), %s %s"):format(L["Command"], f.command, L["procs"], RC.Short(f.cmd), RC.Pct(f.cmdShare),
-          L["avg"], f.cmdAvg and RC.Short(f.cmdAvg) or "-") .. (f.record and ("  |cffffd200" .. L["new best!"] .. "|r") or "")
-      else
-        out[#out + 1] = ("%s: %d %s"):format(L["Command"], f.command, L["procs"])
-      end
+  local cmdKnown, gainKnown, spentKnown
+  if f then cmdKnown, gainKnown, spentKnown = f.commandKnown, f.gainsKnown, f.spentKnown
+  else cmdKnown, gainKnown, spentKnown = RC.CanCountCommand(), RC.CanCountGains(), RC.CanCountSpent() end
+  local cur = f or RC.fight
+  if cmdOn then
+    local line = ("%s: %s %s"):format(L["Command"], n(cur.command, cmdKnown), L["procs"])
+    if f and f.cmd then
+      line = line .. (", %s (%s), %s %s"):format(RC.Short(f.cmd), RC.Pct(f.cmdShare), L["avg"], f.cmdAvg and RC.Short(f.cmdAvg) or "-")
+        .. (f.record and ("  |cffffd200" .. L["new best!"] .. "|r") or "")
     end
-    if reckOn then
-      if f.reck then
-        out[#out + 1] = ("%s: %d %s, %d %s, %s (%s)"):format(L["Reckoning"], f.gained, L["gained"], f.spent, L["swings"], RC.Short(f.reck), RC.Pct(f.reckShare))
-      else
-        out[#out + 1] = ("%s: %d %s, %d %s"):format(L["Reckoning"], f.gained, L["gained"], f.spent, L["swings"])
-      end
-    end
-  else
-    if cmdOn then out[#out + 1] = ("%s: %d %s"):format(L["Command"], RC.fight.command, L["procs"]) end
-    if reckOn then out[#out + 1] = ("%s: %d %s, %d %s"):format(L["Reckoning"], RC.fight.gained, L["gained"], RC.fight.spent, L["swings"]) end
+    out[#out + 1] = line
+  end
+  if reckOn then
+    local line = ("%s: %s %s, %s %s"):format(L["Reckoning"], n(cur.gained, gainKnown), L["gained"], n(cur.spent, spentKnown), L["swings"])
+    if f and f.reck then line = line .. (", %s (%s)"):format(RC.Short(f.reck), RC.Pct(f.reckShare)) end
+    out[#out + 1] = line
   end
   local sess = {}
-  if cmdOn then sess[#sess + 1] = ("%d %s (%s)"):format(s.command or 0, L["Command"], RC.Pct(s.cmdShare)) end
-  if reckOn then sess[#sess + 1] = ("%d %s"):format(s.spent or 0, L["swings"]) end
+  if cmdOn then sess[#sess + 1] = ("%s %s (%s)"):format(n(s.command or 0, RC.CanCountCommand() or (s.command or 0) > 0), L["Command"], RC.Pct(s.cmdShare)) end
+  if reckOn then sess[#sess + 1] = ("%s %s"):format(n(s.spent or 0, RC.auraReadable or (s.spent or 0) > 0), L["swings"]) end
   out[#out + 1] = ("%s: %s"):format(L["Session"], table.concat(sess, ", "))
+  if RC.detect == "none" then
+    out[#out + 1] = NOTE_NONE
+    return out
+  end
+  if reckOn and not spentKnown then out[#out + 1] = NOTE_SPENT end
   if cmdOn and db and db.commandSplits == false then
     out[#out + 1] = "|cffaaaaaa" .. L["No Command meter line: counting procs only."] .. "|r"
   elseif reckOn and db and db.reckSplits == false then
@@ -277,8 +286,9 @@ function UI.RenderLive()
   local f = RC.fight
   local mode = RC.Mode()
   local parts = {}
-  if mode ~= "reckoning" then parts[#parts + 1] = ("%s %d"):format(L["Command"], f.command) end
-  if mode ~= "command" then parts[#parts + 1] = ("%s +%d, %d %s"):format(L["Reckoning"], f.gained, f.spent, L["swings"]) end
+  if mode ~= "reckoning" then parts[#parts + 1] = ("%s %s"):format(L["Command"], n(f.command, RC.CanCountCommand())) end
+  if mode ~= "command" then parts[#parts + 1] = ("%s +%s, %s %s"):format(L["Reckoning"], n(f.gained, RC.CanCountGains()),
+    n(f.spent, RC.CanCountSpent()), L["swings"]) end
   local head = L["Fight"] .. ": " .. table.concat(parts, "  ")
   local src = RC.LiveSource and RC.LiveSource()
   local total = src and src.totalAmount
